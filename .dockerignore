@@ -1,0 +1,15 @@
+# Git / Docker
+.git/
+.gitignore
+.dockerignore
+Dockerfile
+
+# Python venv
+.venv/
+venv/
+env/
+
+# OS / Editor
+.DS_Store
+*.swp
+.vscode/
