@@ -83,3 +83,78 @@ class DynamicsModel(nn.Module):
         lstm_out, next_hidden_state = self.lstm(z_sequence, hidden_state)
         predicted_z_sequence = self.fc_out(lstm_out)
         return predicted_z_sequence, next_hidden_state
+    
+    
+# ----------------------------------------------------------------------
+# ★★★ 損失関数 ★★★
+# ----------------------------------------------------------------------
+
+# 1. VAEの損失関数
+def vae_loss_function(recon_x, x, mu, logvar, beta=1.0):
+    """VAEの損失: 再構成誤差 (BCE) + KLダイバージェンス"""
+    # BCE (Binary Cross Entropy): 再構成誤差 - ピクセルレベルで比較
+    recon_loss = F.binary_cross_entropy(recon_x.view(recon_x.size(0), -1), x.view(x.size(0), -1), reduction='sum')
+    
+    # KLD (KL Divergence): 潜在空間の正則化 - 標準正規分布からの逸脱を罰する
+    kld_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+
+    return recon_loss + beta * kld_loss
+    
+# (M) MDNRNN: ダイナミクスモデル (Dynamics Model)
+class MDNRNN(nn.Module):
+    def __init__(self, z_dim, rnn_hidden_dim, num_gaussians):
+        super(MDNRNN, self).__init__()
+        self.z_dim = z_dim
+        self.rnn_hidden_dim = rnn_hidden_dim
+        self.num_gaussians = num_gaussians
+
+        # 1. LSTMコア - 潜在変数zの時系列パターンを学習
+        self.lstm = nn.LSTM(
+            input_size=z_dim,
+            hidden_size=rnn_hidden_dim,
+            num_layers=1, 
+            batch_first=True
+        )
+        
+        # 2. MDN出力層 - 混合ガウス分布のパラメータ (μ, σ, π) を予測
+        self.mdn_output_layer = nn.Linear(
+            rnn_hidden_dim,
+            num_gaussians * (2 * z_dim + 1)
+        )
+
+    def forward(self, z_sequence, hidden_state=None):
+        lstm_out, next_hidden_state = self.lstm(z_sequence, hidden_state)
+        mdn_params = self.mdn_output_layer(lstm_out)
+        
+        B, T, _ = mdn_params.shape
+        
+        # μ (平均) を抽出
+        mus = mdn_params[..., :self.num_gaussians * self.z_dim].view(B, T, self.num_gaussians, self.z_dim)
+        
+        # σ (標準偏差) を抽出 (exp()により必ず正の値にする)
+        sigmas = torch.exp(mdn_params[..., self.num_gaussians * self.z_dim : 2 * self.num_gaussians * self.z_dim].view(B, T, self.num_gaussians, self.z_dim))
+        
+        # log(π) (混合係数の対数) を抽出 (log_softmaxにより合計が1になることを保証)
+        log_pi = F.log_softmax(mdn_params[..., 2 * self.num_gaussians * self.z_dim:].view(B, T, self.num_gaussians), dim=-1)
+        
+        return mus, sigmas, log_pi, next_hidden_state
+
+# 2. MDN-RNNの損失関数 (NLL: 負の対数尤度)
+def gmm_nll_loss(targets, mus, sigmas, log_pi):
+    """GMM (混合ガウス分布) の負の対数尤度を計算"""    
+    targets = targets.unsqueeze(2) # (B, T, 1, z_dim) に拡張
+    z_dim = targets.shape[-1] # ターゲットからz_dimを取得
+
+    # 各ガウス分布の対数確率密度を計算
+    log_sigma = torch.log(sigmas)
+    exponent = -0.5 * ((targets - mus) / sigmas) ** 2
+    log_prob_const = -0.5 * z_dim * np.log(2 * np.pi)
+    
+    # z_dim全体で合計し、各ガウス分布の対数尤度を求める (B, T, num_gaussians)
+    log_probs = log_prob_const - log_sigma.sum(dim=-1) + exponent.sum(dim=-1)
+
+    # logsumexpトリックで混合分布の対数尤度 log(Σ π_k * N_k) を安定して計算
+    log_likelihood = torch.logsumexp(log_pi + log_probs, dim=-1)
+    
+    # 負の対数尤度を最小化する
+    return -torch.mean(log_likelihood)

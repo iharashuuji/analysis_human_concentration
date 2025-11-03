@@ -1,39 +1,38 @@
 import streamlit as st
 import torch
 import os
-from models.world_model import VAE, DynamicsModel
+from models.world_model import VAE, MDNRNN # DynamicsModelの代わりにMDNRNNをインポート
 
-# --- パスとパラメータ ---
-VAE_MODEL_PATH = "weights/vae_engage3_only.pth"
-RNN_MODEL_PATH = "weights/rnn_engage3_only.pth"
-Z_DIM = 32
-RNN_HIDDEN_DIM = 256
+from utils.logger import setup_logger
+
+logger = setup_logger()
 
 @st.cache_resource
-def load_models():
+def load_models(vae_path, rnn_path, z_dim, rnn_hidden_dim):
     """
     訓練済みのVAEとRNNモデルをロードする。
     CPU環境 (Docker内など) を想定し、map_location="cpu" を指定。
     """
-    # ローカルPCのGPUで動かす場合は "cuda" も可
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Loading models to {device}...")
+    logger.info(f"Loading models to device: {device}")
 
     # VAE (観測モデル)
-    vae_model = VAE(z_dim=Z_DIM).to(device)
-    if not os.path.exists(VAE_MODEL_PATH):
-        st.error(f"VAEモデルファイルが見つかりません: {VAE_MODEL_PATH}")
-        return None, None
-    vae_model.load_state_dict(torch.load(VAE_MODEL_PATH, map_location=device))
+    vae_model = VAE(z_dim=z_dim).to(device)
+    logger.info(f"Attempting to load VAE model from: {vae_path}")
+    if not os.path.exists(vae_path):
+        st.error(f"VAEモデルファイルが見つかりません: {vae_path}")
+        return None, None, None
+    vae_model.load_state_dict(torch.load(vae_path, map_location=device))
     vae_model.eval()
 
-    # RNN (ダイナミクスモデル)
-    rnn_model = DynamicsModel(z_dim=Z_DIM, rnn_hidden_dim=RNN_HIDDEN_DIM).to(device)
-    if not os.path.exists(RNN_MODEL_PATH):
-        st.error(f"RNNモデルファイルが見つかりません: {RNN_MODEL_PATH}")
-        return None, None
-    rnn_model.load_state_dict(torch.load(RNN_MODEL_PATH, map_location=device))
+    # MDN-RNN (ダイナミクスモデル)
+    # num_gaussiansは学習時と合わせる
+    rnn_model = MDNRNN(z_dim=z_dim, rnn_hidden_dim=rnn_hidden_dim, num_gaussians=5).to(device)
+    logger.info(f"Attempting to load RNN model from: {rnn_path}")
+    if not os.path.exists(rnn_path):
+        st.error(f"RNNモデルファイルが見つかりません: {rnn_path}")
+        return None, None, None
+    rnn_model.load_state_dict(torch.load(rnn_path, map_location=device))
     rnn_model.eval()
 
-    print("Models loaded successfully.")
     return vae_model, rnn_model, device
