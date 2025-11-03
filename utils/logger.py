@@ -10,7 +10,7 @@ def setup_logger():
     """
     # ルートロガーを取得
     logger = logging.getLogger()
-    logger.setLevel(logging.INFO)
+    logger.setLevel(logging.DEBUG)
 
     # 既存のハンドラをクリア
     if logger.hasHandlers():

@@ -12,6 +12,8 @@ import random
 from tqdm import tqdm
 import time # 処理時間計測用
 
+
+
 # --- 1. デバイス設定 ---
 # Vast.ai上のGPUを自動で利用
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -19,7 +21,7 @@ print(f"Using device: {device}")
 
 # --- 2. モデルのクラス定義 (VAE and DynamicsModel) ---
 # ※プロジェクトの構造上は models/world_model.py に分離すべきですが、
-#   ここでは単一ファイルで完結させます。
+#   ここでは単一ファイルで完結させます。 (models/world_model.py からインポートするように変更も可能です)
 
 class VAE(nn.Module):
     """(V) 観測モデル"""
@@ -57,16 +59,49 @@ class VAE(nn.Module):
         mu, logvar = self.encode(x); z = self.reparameterize(mu, logvar); return self.decode(z), mu, logvar
 
 class DynamicsModel(nn.Module):
-    """(M) ダイナミクスモデル"""
+    """(M) ダイナミクスモデル (シンプルなMSE版)"""
     def __init__(self, z_dim=32, rnn_hidden_dim=256):
         super(DynamicsModel, self).__init__()
         self.lstm = nn.LSTM(input_size=z_dim, hidden_size=rnn_hidden_dim, num_layers=1, batch_first=True)
         self.fc_out = nn.Linear(rnn_hidden_dim, z_dim)
 
     def forward(self, z_sequence, hidden_state=None):
+        # LSTMの隠れ状態は (h, c) のタプル
         lstm_out, next_hidden_state = self.lstm(z_sequence, hidden_state)
         predicted_z_sequence = self.fc_out(lstm_out)
         return predicted_z_sequence, next_hidden_state
+
+# (M) MDNRNN: Mixture Density Network RNN
+class MDNRNN(nn.Module):
+    def __init__(self, z_dim, rnn_hidden_dim, num_gaussians):
+        super(MDNRNN, self).__init__()
+        self.z_dim = z_dim
+        self.rnn_hidden_dim = rnn_hidden_dim
+        self.num_gaussians = num_gaussians
+
+        # 1. LSTMコア
+        self.lstm = nn.LSTM(
+            input_size=z_dim,
+            hidden_size=rnn_hidden_dim,
+            num_layers=1,
+            batch_first=True
+        )
+        # 2. MDN出力層 - 混合ガウス分布のパラメータ (μ, σ, π) を予測
+        self.mdn_output_layer = nn.Linear(
+            rnn_hidden_dim,
+            num_gaussians * (2 * z_dim + 1)
+        )
+
+    def forward(self, z_sequence, hidden_state=None):
+        lstm_out, next_hidden_state = self.lstm(z_sequence, hidden_state)
+        mdn_params = self.mdn_output_layer(lstm_out)
+
+        B, T, _ = mdn_params.shape
+        mus = mdn_params[..., :self.num_gaussians * self.z_dim].view(B, T, self.num_gaussians, self.z_dim)
+        sigmas = torch.exp(mdn_params[..., self.num_gaussians * self.z_dim : 2 * self.num_gaussians * self.z_dim].view(B, T, self.num_gaussians, self.z_dim))
+        log_pi = F.log_softmax(mdn_params[..., 2 * self.num_gaussians * self.z_dim:].view(B, T, self.num_gaussians), dim=-1)
+
+        return mus, sigmas, log_pi, next_hidden_state
 
 # --- 3. データセットクラス ---
 
@@ -124,10 +159,40 @@ class DaisEeNormalDataset(Dataset):
             return torch.stack(clip)
 
 # --- VAE 損失関数 ---
-def vae_loss_function(recon_x, x, mu, logvar):
-    BCE = F.binary_cross_entropy(recon_x.view(-1, 64*64), x.view(-1, 64*64), reduction='sum')
-    KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-    return BCE + KLD
+def vae_loss_function(recon_x, x, mu, logvar, beta=4.0):
+    """
+    β-VAEの損失関数を計算します。
+    論文: "β-VAE: Learning Basic Visual Concepts with a Constrained Variational Framework"
+    
+    Args:
+        recon_x (torch.Tensor): VAEによって再構成された画像。
+        x (torch.Tensor): 元の入力画像。
+        mu (torch.Tensor): 潜在空間の平均。
+        logvar (torch.Tensor): 潜在空間の対数分散。
+        beta (float): KLダイバージェンス項の重み係数。β > 1.0 に設定することで、
+                      より表現が分離された(disentangled)潜在空間の学習を促進します。
+    """
+    # 1. 再構成誤差 (Reconstruction Loss): 元の画像と復元画像のピクセルごとの差を計算
+    recon_loss = F.binary_cross_entropy(recon_x.view(-1, 64*64), x.view(-1, 64*64), reduction='sum')
+    # 2. KLダイバージェンス (KL Divergence): 潜在変数の分布を標準正規分布に近づけるための正則化項
+    kld_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+    
+    # 論文に基づき、KLダイバージェンスに重みβを適用
+    return recon_loss + beta * kld_loss
+
+# --- MDN-RNN 損失関数 ---
+def gmm_nll_loss(targets, mus, sigmas, log_pi):
+    """GMM (混合ガウス分布) の負の対数尤度を計算"""
+    targets = targets.unsqueeze(2)
+    z_dim = targets.shape[-1]
+
+    log_sigma = torch.log(sigmas)
+    exponent = -0.5 * ((targets - mus) / sigmas) ** 2
+    log_prob_const = -0.5 * z_dim * np.log(2 * np.pi)
+
+    log_probs = log_prob_const - log_sigma.sum(dim=-1) + exponent.sum(dim=-1)
+    log_likelihood = torch.logsumexp(log_pi + log_probs, dim=-1)
+    return -torch.mean(log_likelihood)
 
 # ----------------------------------------------------------------------
 # ★★★ パラメータ設定 ★★★
@@ -141,15 +206,17 @@ os.makedirs(WEIGHTS_DIR, exist_ok=True)
 # VAEパラメータ
 Z_DIM = 32
 VAE_LR = 1e-3
-VAE_EPOCHS = 20  # GPU環境ならこの程度は回したい
+VAE_EPOCHS = 60  # GPU環境ならこの程度は回したい
 VAE_BATCH_SIZE = 64
+VAE_BETA = 4.0 # ★★★ β-VAEのためのβ値。論文では4が推奨されることが多い ★★★
 
 # RNNパラメータ
 RNN_LR = 1e-4
-RNN_EPOCHS = 50  # VAEより多めに回す
+RNN_EPOCHS = 100  # VAEより多めに回す
 RNN_BATCH_SIZE = 32
 RNN_SEQ_LEN = 10 
 RNN_HIDDEN_DIM = 256
+NUM_GAUSSIANS = 5 # 混合ガウス分布の数
 
 transform_base = transforms.Compose([
     transforms.Resize((64, 64)),
@@ -181,7 +248,10 @@ def train_vae():
             
             optimizer_vae.zero_grad()
             recon_images, mu, logvar = vae_model(images)
-            loss = vae_loss_function(recon_images, images, mu, logvar)
+            
+            # ★★★ 修正点: β-VAEの損失関数を適用 ★★★
+            # VAE_BETAを引数として渡し、KLダイバージェンスを強調します。
+            loss = vae_loss_function(recon_images, images, mu, logvar, beta=VAE_BETA)
             
             loss.backward()
             optimizer_vae.step()
@@ -208,9 +278,12 @@ def train_rnn(vae_model):
     rnn_dataloader = DataLoader(rnn_dataset, batch_size=RNN_BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True)
     
     # RNNモデル
-    rnn_model = DynamicsModel(z_dim=Z_DIM, rnn_hidden_dim=RNN_HIDDEN_DIM).to(device)
+    # ★★★ 修正点: DynamicsModel -> MDNRNN ★★★
+    rnn_model = MDNRNN(z_dim=Z_DIM, rnn_hidden_dim=RNN_HIDDEN_DIM, num_gaussians=NUM_GAUSSIANS).to(device)
     optimizer_rnn = Adam(rnn_model.parameters(), lr=RNN_LR)
-    loss_fn_rnn = nn.MSELoss() 
+    # ★★★ 修正点: 損失関数を gmm_nll_loss に変更 ★★★
+    # loss_fn_rnn = nn.MSELoss()
+
     model_path = os.path.join(WEIGHTS_DIR, 'rnn_engage3_only.pth')
 
     # VAEはエンコーダとして固定
@@ -233,9 +306,11 @@ def train_rnn(vae_model):
             targets_z = z_sequence[:, 1:, :]  # t=1 から t=Seq_Len
 
             optimizer_rnn.zero_grad()
-            predicted_z, _ = rnn_model(inputs_z)
+            # ★★★ 修正点: MDNRNNの出力に合わせて損失を計算 ★★★
+            mus, sigmas, log_pi, _ = rnn_model(inputs_z)
             
-            loss = loss_fn_rnn(predicted_z, targets_z)
+            # MSELoss の代わりに gmm_nll_loss を使用
+            loss = gmm_nll_loss(targets_z, mus, sigmas, log_pi)
             
             loss.backward()
             optimizer_rnn.step()

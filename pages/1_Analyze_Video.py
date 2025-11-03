@@ -6,9 +6,15 @@ from utils.processor import analyze_video
 st.set_page_config(page_title="動画分析", page_icon="📈", layout="wide")
 st.title("📈 動画セッションの分析")
 
+# --- モデルパラメータ ---
+VAE_MODEL_PATH = "weights/vae_engage3_only.pth"
+RNN_MODEL_PATH = "weights/rnn_engage3_only.pth"
+Z_DIM = 32
+RNN_HIDDEN_DIM = 256
+
 # 1. モデルの読み込み (キャッシュされる)
 with st.spinner("世界モデル（VAE+RNN）をロード中..."):
-    vae_model, rnn_model, device = load_models()
+    vae_model, rnn_model, device = load_models(VAE_MODEL_PATH, RNN_MODEL_PATH, Z_DIM, RNN_HIDDEN_DIM)
 
 if vae_model is None or rnn_model is None:
     st.error("モデルのロードに失敗しました。weights/ フォルダを確認してください。")
